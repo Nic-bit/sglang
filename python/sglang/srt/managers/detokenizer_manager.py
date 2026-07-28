@@ -28,6 +28,9 @@ import zmq
 
 from sglang.srt.constants import HEALTH_CHECK_RID_PREFIX
 from sglang.srt.environ import envs
+from sglang.srt.managers.beam_search_detokenizer_mixin import (
+    BeamSearchDetokenizerMixin,
+)
 from sglang.srt.managers.io_struct import (
     BatchEmbeddingOutput,
     BatchStrOutput,
@@ -36,6 +39,8 @@ from sglang.srt.managers.io_struct import (
     FreezeGCReq,
     sock_recv,
     sock_send,
+    unwrap_from_pickle,
+    wrap_as_pickle,
 )
 from sglang.srt.managers.multi_tokenizer_mixin import MultiHttpWorkerDetokenizerMixin
 from sglang.srt.observability.cpu_monitor import start_cpu_monitor_thread
@@ -88,7 +93,7 @@ class DecodeStatus:
         return self.decoded_text
 
 
-class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
+class DetokenizerManager(BeamSearchDetokenizerMixin, MultiHttpWorkerDetokenizerMixin):
     """DetokenizerManager is a process that detokenizes the token ids."""
 
     def __init__(
@@ -428,12 +433,18 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
         ]
 
     def handle_batch_token_id_out(self, recv_obj: BatchTokenIDOutput):
-        # If handling idle batch, set output_strs to [].
-        output_strs = (
-            self._decode_batch_token_id_output(recv_obj)
-            if len(recv_obj.rids) > 0
-            else []
-        )
+        beam_search_output = unwrap_from_pickle(recv_obj.beam_search_output)
+        if self.is_beam_search_batch(beam_search_output):
+            self.decode_beam_search_output(recv_obj, beam_search_output)
+            # Text lives inside beam_search_output; per-request output_strs empty.
+            output_strs = [""] * len(recv_obj.rids)
+        else:
+            # If handling idle batch, set output_strs to [].
+            output_strs = (
+                self._decode_batch_token_id_output(recv_obj)
+                if len(recv_obj.rids) > 0
+                else []
+            )
         routed_experts = self._b64_encode_per_request(recv_obj.routed_experts)
         indexer_topk = self._b64_encode_per_request(recv_obj.indexer_topk)
         return BatchStrOutput(
@@ -479,6 +490,9 @@ class DetokenizerManager(MultiHttpWorkerDetokenizerMixin):
             placeholder_tokens_val=None,
             retraction_counts=recv_obj.retraction_counts,
             token_steps=recv_obj.token_steps,
+            beam_search_output=(
+                wrap_as_pickle(beam_search_output) if beam_search_output else None
+            ),
             dp_ranks=recv_obj.dp_ranks,
             time_stats=recv_obj.time_stats,
         )

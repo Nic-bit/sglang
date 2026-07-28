@@ -410,6 +410,32 @@ class GenerateReqInput:
                 self.is_single = False
                 self.batch_size = len(self.input_embeds)
 
+    def _handle_beam_search_parallel_sampling(self) -> int:
+        """Force parallel sampling to 1 when beam search is enabled.
+
+        In beam search mode ``n`` is interpreted as the beam width (must be > 1)
+        and a single request is expanded internally into ``n`` beams rather than
+        ``n`` independent parallel samples.
+        """
+        # Lazily import to avoid a circular dependency at module load time.
+        from sglang.srt.server_args import get_global_server_args
+
+        # Treat as disabled when global server args are unset (e.g. unit tests).
+        try:
+            enable_beam_search = get_global_server_args().enable_beam_search
+        except ValueError:
+            enable_beam_search = False
+        if not enable_beam_search:
+            return self.parallel_sample_num
+
+        if self.parallel_sample_num <= 1:
+            raise ValueError(
+                f"Beam search mode requires n > 1 (beam_width), but got "
+                f"n={self.parallel_sample_num}. Please set n to a value greater "
+                "than 1 in sampling_params."
+            )
+        return 1
+
     def _handle_parallel_sampling(self):
         """Handle parallel sampling parameters and adjust batch size if needed."""
         # Determine parallel sample count
@@ -425,6 +451,8 @@ class GenerateReqInput:
                     raise ValueError(
                         "The parallel_sample_num should be the same for all samples in sample params."
                     )
+
+        self.parallel_sample_num = self._handle_beam_search_parallel_sampling()
 
         # If using parallel sampling with a single example, convert to batch
         if self.parallel_sample_num > 1 and self.is_single:
@@ -1309,6 +1337,9 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
 
+    # Beam search candidate sequences (pickled List[BeamSearchOutput]).
+    beam_search_output: Optional[PickleWrapper] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1390,6 +1421,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     # Acceptance histogram
     spec_correct_drafts_histogram: Optional[List[List[int]]] = None
     spec_cap_lens_histogram: Optional[List[List[int]]] = None
+
+    # Beam search candidate sequences (pickled List[BeamSearchOutput]).
+    beam_search_output: Optional[PickleWrapper] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

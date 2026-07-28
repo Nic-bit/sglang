@@ -74,6 +74,10 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_evict_dsv4_state,
 )
 from sglang.srt.managers.embed_types import PositionalEmbeds
+from sglang.srt.managers.schedule_batch_beam_search_mixin import (
+    ReqBeamSearchMixin,
+    ScheduleBatchBeamSearchMixin,
+)
 from sglang.srt.managers.scheduler_components.new_token_ratio_tracker import (
     NewTokenRatioTracker,
 )
@@ -710,7 +714,7 @@ class ReqKvInfo:
     swa_evicted_seqlen: int
 
 
-class Req(ReqDllmMixin):
+class Req(ReqDllmMixin, ReqBeamSearchMixin):
     """The input and output status of a request."""
 
     def __init__(
@@ -757,6 +761,7 @@ class Req(ReqDllmMixin):
         return_pooled_hidden_states: bool = False,
         multi_item_delimiter_indices: Optional[List[int]] = None,
         session_id: Optional[str] = None,
+        is_beam_search: bool = False,
     ):
         # Input and output info
         self.rid = rid
@@ -1084,6 +1089,10 @@ class Req(ReqDllmMixin):
         # For hisparse
         self.hisparse_staging = False
 
+        # Beam search (initialized via ReqBeamSearchMixin). Placed last so it can
+        # override logprob-related attributes set earlier in __init__.
+        self._init_beam_search_attributes(is_beam_search, self.sampling_params)
+
     @property
     def seqlen(self) -> int:
         """Get the current sequence length of the request."""
@@ -1093,9 +1102,14 @@ class Req(ReqDllmMixin):
     def is_prefill_only(self) -> bool:
         """Check if this request is prefill-only (no token generation needed)."""
         # NOTE: when spec is enabled, prefill_only optimizations are disabled
-
-        spec_alg = get_server_args().speculative_algorithm
-        return self.sampling_params.max_new_tokens == 0 and spec_alg is None
+        # NOTE: beam search requires sampling to obtain logprobs, so it can
+        # never be prefill-only.
+        server_args = get_server_args()
+        return (
+            self.sampling_params.max_new_tokens == 0
+            and server_args.speculative_algorithm is None
+            and not server_args.enable_beam_search
+        )
 
     @property
     def output_ids_through_stop(self) -> array[int]:
@@ -1821,7 +1835,9 @@ def _compute_chunked_req_next_prompt_token(
 
 
 @dataclasses.dataclass
-class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
+class ScheduleBatch(
+    ScheduleBatchDisaggregationDecodeMixin, ScheduleBatchBeamSearchMixin
+):
     """Store all information of a batch on the scheduler."""
 
     # === Core: request list (ForwardBatch derives lora_ids / rids / grammars / positions from it) ===
@@ -2854,6 +2870,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if hasattr(self, "attn_cp_metadata") and self.attn_cp_metadata is not None:
             self.attn_cp_metadata = None
 
+        if self.reqs and self.reqs[0].is_beam_search:
+            self.prepare_for_beam_search_decode()
+            return
+
         if not self.spec_algorithm.is_none():
             # Spec decoding owns decode preparation (allocation, seq-lens bookkeeping).
             from sglang.srt.speculative.spec_utils import spec_prepare_for_decode
@@ -2920,6 +2940,13 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         chunked_req_to_exclude: Optional[Union[Req, List[Req]]] = None,
         keep_indices: Optional[List[int]] = None,
     ):
+        if self.reqs and self.reqs[0].is_beam_search:
+            self.filter_beam_search_batch(
+                chunked_req_to_exclude=chunked_req_to_exclude,
+                keep_indices=keep_indices,
+            )
+            return
+
         if keep_indices is None:
             if isinstance(chunked_req_to_exclude, Req):
                 chunked_req_to_exclude = [chunked_req_to_exclude]

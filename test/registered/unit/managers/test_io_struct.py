@@ -1,5 +1,7 @@
 import copy
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from sglang.srt.managers.io_struct import GenerateReqInput
 from sglang.test.ci.ci_register import (
@@ -25,6 +27,15 @@ class TestGenerateReqInputNormalization(CustomTestCase):
     def setUpClass(cls):
         cls.model = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
         cls.base_url = DEFAULT_URL_FOR_TEST
+
+        # Mock get_global_server_args once for all tests. The name is imported
+        # lazily inside io_struct, so patch it at its source module.
+        cls.mock_get_global_server_args = patch(
+            "sglang.srt.server_args.get_global_server_args",
+            return_value=SimpleNamespace(enable_beam_search=False),
+        )
+        cls.mock_get_global_server_args.start()
+        cls.addClassCleanup(cls.mock_get_global_server_args.stop)
 
     def setUp(self):
         # Common setup for all tests

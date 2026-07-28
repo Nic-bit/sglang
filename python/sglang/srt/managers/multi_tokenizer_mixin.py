@@ -124,7 +124,11 @@ def _extract_field_by_index(
     if field is None:
         return None
 
-    should_wrap_result = field_name in ("customized_info", "time_stats")
+    should_wrap_result = field_name in (
+        "customized_info",
+        "time_stats",
+        "beam_search_output",
+    )
     if should_wrap_result:
         field = unwrap_from_pickle(field)
         if field is None:
@@ -248,6 +252,9 @@ def _handle_output_by_index(output, i):
                 output, "indexer_topk", i, check_length=False
             ),
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             token_steps=_extract_field_by_index(
@@ -362,6 +369,9 @@ def _handle_output_by_index(output, i):
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=_extract_field_by_index(output, "retraction_counts", i),
+            beam_search_output=_extract_field_by_index(
+                output, "beam_search_output", i, check_length=True
+            ),
             token_steps=_extract_field_by_index(
                 output, "token_steps", i, check_length=False
             ),

@@ -288,6 +288,7 @@ class _GenerationStreamAccumulator:
     spec_correct_drafts_histogram: list = field(default_factory=list)
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
+    beam_search_output: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -341,7 +342,12 @@ class _GenerationStreamAccumulator:
                 req.finished_len = len(req.output_ids)
             should_output = True
         else:
-            if req.stream:
+            if req.is_beam_search:
+                # Beam search only emits output for finished requests; the
+                # finished branch above sets should_output=True. Unfinished
+                # beams never stream intermediate tokens.
+                should_output = False
+            elif req.stream:
                 stream_interval = (
                     req.sampling_params.stream_interval or self.default_stream_interval
                 )
@@ -392,6 +398,19 @@ class _GenerationStreamAccumulator:
         self.reasoning_tokens.append(req.reasoning_tokens)
         self.completion_tokens.append(len(output_ids_))
         self.cached_tokens.append(req.cached_tokens)
+
+        if req.is_beam_search:
+            # Lazy import to avoid a module-load-time cycle with the scheduler.
+            from sglang.srt.managers.scheduler_beam_search_processor_mixin import (
+                SchedulerBeamSearchProcessorMixin,
+            )
+
+            self.completion_tokens[-1] = (
+                SchedulerBeamSearchProcessorMixin.sum_beam_completion_tokens(req)
+            )
+            self.beam_search_output.append(
+                SchedulerBeamSearchProcessorMixin.convert_beam_sequences_to_output(req)
+            )
 
         # Collect detailed cache breakdown if available
         self.cached_tokens_details.append(self.get_cached_tokens_details(req))
@@ -608,5 +627,10 @@ class _GenerationStreamAccumulator:
             placeholder_tokens_idx=None,
             placeholder_tokens_val=None,
             retraction_counts=self.retraction_counts,
+            beam_search_output=(
+                wrap_as_pickle(self.beam_search_output)
+                if self.beam_search_output
+                else None
+            ),
             dp_ranks=dp_ranks,
         )

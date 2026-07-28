@@ -247,6 +247,13 @@ class Envs:
     SGLANG_GEMMA_OUT_OF_PLACE_POSITION_MUTATION = EnvBool(False)
     SGLANG_ENABLE_WEIGHT_LOADER_V2 = EnvBool(False)
 
+    # Beam search
+    # Opt-in cascade attention for beam search decode: share a single attention
+    # pass over the common prefix across a request's beams instead of reading
+    # the shared KV once per beam. Only effective with --enable-beam-search on a
+    # supported attention backend; no-op otherwise. Phase 2 feature (WIP).
+    SGLANG_BEAM_SEARCH_CASCADE_ATTN = EnvBool(False)
+
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.
     SGLANG_ENABLE_REQUEST_DECOMPRESSION = EnvBool(False)

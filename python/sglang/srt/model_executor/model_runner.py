@@ -1610,6 +1610,14 @@ class ModelRunner:
         Returns:
             A list of next_token_ids
         """
+        if forward_batch.is_beam_search:
+            # For beam search, only compute full-vocab logprobs here; token
+            # selection is handled by the scheduler's beam expansion logic.
+            logits_output.logprobs = torch.nn.functional.log_softmax(
+                logits_output.next_token_logits, dim=-1
+            )
+            return None
+
         self._preprocess_logits(logits_output, forward_batch.sampling_info)
 
         # Sample the next tokens
