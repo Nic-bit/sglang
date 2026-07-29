@@ -26,6 +26,9 @@ from sglang.kernels.ops.attention.utils import (
 from sglang.srt.dllm.config import DllmConfig
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.base_attn_backend import AttentionBackend
+from sglang.srt.layers.attention.flashinfer_beam_cascade import (
+    beam_cascade_supported,
+)
 from sglang.srt.layers.quantization.fp4_kv_cache_quant_method import (
     KVCacheAttentionAccessKind,
 )
@@ -160,6 +163,8 @@ class DecodeMetadata:
     decode_wrappers: List[BatchDecodeWithPagedKVCacheWrapper]
     # full->SWA translated out_cache_loc (SWA KV-store write target)
     swa_out_cache_loc: Optional[torch.Tensor] = None
+    # Beam-search cascade plan for this step; None means the regular path.
+    beam_cascade: Optional[object] = None
 
 
 @dataclass
@@ -523,6 +528,13 @@ class FlashInferAttnBackend(AttentionBackend):
                 model_runner, self
             )  # for verify
         self.indices_updater_decode = FlashInferIndicesUpdaterDecode(model_runner, self)
+
+        # Beam-search cascade attention (opt-in). The helper owns its own
+        # wrappers and is created lazily on the first beam decode batch so the
+        # default path allocates nothing.
+        self._beam_cascade_helper = None
+        self._beam_cascade_model_runner = model_runner
+        self._beam_cascade_warned = False
 
         # Other metadata
         self.forward_metadata: Union[PrefillMetadata, DecodeMetadata] = None
@@ -913,6 +925,34 @@ class FlashInferAttnBackend(AttentionBackend):
             return None, None
         return layer.k_scale, layer.v_scale
 
+    def _maybe_plan_beam_cascade(self, forward_batch: ForwardBatch):
+        """Plan beam-search cascade attention for this decode step.
+
+        Returns the cascade metadata, or None to use the regular decode path.
+        """
+        if not forward_batch.beam_widths:
+            # Not a beam decode batch, or the feature is disabled (the metadata
+            # is only populated when SGLANG_BEAM_SEARCH_CASCADE_ATTN is set).
+            return None
+
+        from sglang.srt.layers.attention.flashinfer_beam_cascade import (
+            BeamCascadeDecodeHelper,
+        )
+
+        if self._beam_cascade_helper is None:
+            self._beam_cascade_helper = BeamCascadeDecodeHelper(
+                self._beam_cascade_model_runner, self
+            )
+
+        metadata = self._beam_cascade_helper.plan(forward_batch)
+        if metadata is None and not self._beam_cascade_warned:
+            self._beam_cascade_warned = True
+            logger.warning(
+                "Beam search cascade attention was requested but this batch is "
+                "not eligible; falling back to the regular decode path."
+            )
+        return metadata
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -922,6 +962,7 @@ class FlashInferAttnBackend(AttentionBackend):
             )
 
         if forward_batch.forward_mode.is_decode_or_idle():
+            beam_cascade = self._maybe_plan_beam_cascade(forward_batch)
             self.indices_updater_decode.update(
                 forward_batch.req_pool_indices,
                 forward_batch.seq_lens,
@@ -934,7 +975,9 @@ class FlashInferAttnBackend(AttentionBackend):
                 disable_split_kv=False,
             )
             self.forward_metadata = DecodeMetadata(
-                self.decode_wrappers, swa_out_cache_loc=swa_out_cache_loc
+                self.decode_wrappers,
+                swa_out_cache_loc=swa_out_cache_loc,
+                beam_cascade=beam_cascade,
             )
         elif forward_batch.forward_mode.is_target_verify():
             self.indices_updater_prefill.update(
@@ -1451,6 +1494,18 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         else:
             kv_cache = self.token_to_kv_pool.get_kv_buffer(layer.layer_id)
+
+        # Beam-search cascade path: shared prompt KV is read once per request
+        # instead of once per beam. Falls back per-layer when unsupported.
+        beam_cascade = getattr(self.forward_metadata, "beam_cascade", None)
+        if (
+            beam_cascade is not None
+            and not self.decode_uses_dequant_workspace
+            and beam_cascade_supported(layer)
+        ):
+            return self._beam_cascade_helper.forward(
+                q, kv_cache, layer, beam_cascade
+            )
 
         # Call the wrapped function
         o = decode_wrapper.forward(

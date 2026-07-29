@@ -500,6 +500,11 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
+        # Beam-search cascade attention re-plans two wrappers every step with
+        # batch-dependent shapes, which is incompatible with graph replay.
+        if forward_batch.beam_widths:
+            return False
+
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
             return False

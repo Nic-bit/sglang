@@ -28,7 +28,6 @@ from typing import TYPE_CHECKING, List, Optional, Tuple
 
 import torch
 
-from sglang.srt.environ import envs
 from sglang.srt.managers.beam_search_type import BeamSearchOutput, BeamSearchSequence
 from sglang.srt.managers.schedule_batch import (
     FINISH_LENGTH,
@@ -112,19 +111,6 @@ class SchedulerBeamSearchProcessorMixin:
             beam search does not support grammar
         """
         self.metrics_reporter.num_generated_tokens += len(batch.req_pool_indices)
-
-        # Phase 2 (WIP): opt-in cascade attention for the shared beam prefix.
-        # The env flag reserves the wiring point; the kernel-level path is not
-        # implemented yet, so we fall back to the standard per-beam decode.
-        if envs.SGLANG_BEAM_SEARCH_CASCADE_ATTN.get() and not getattr(
-            self, "_beam_cascade_attn_warned", False
-        ):
-            logger.warning(
-                "SGLANG_BEAM_SEARCH_CASCADE_ATTN is set but cascade attention "
-                "for beam search is not implemented yet; using the standard "
-                "per-beam decode path."
-            )
-            self._beam_cascade_attn_warned = True
 
         beam_output_top_tokens, beam_output_top_logprobs = self._extract_beam_topk_data(
             batch, result

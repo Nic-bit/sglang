@@ -450,6 +450,15 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     is_prefill_only: bool = False
     # For beam search
     is_beam_search: bool = False
+    # Per-request beam metadata, only populated for beam-search decode batches and
+    # only when cascade attention is enabled. All three lists are parallel and
+    # ordered by batch.reqs; together they describe how the batch rows are
+    # grouped into beams:
+    #   beam_slot_starts[i] .. +beam_widths[i] are the rows of request i
+    #   beam_prompt_lens[i] is the shared prompt prefix length of request i
+    beam_widths: Optional[List[int]] = None
+    beam_prompt_lens: Optional[List[int]] = None
+    beam_slot_starts: Optional[List[int]] = None
     spec_algorithm: SpeculativeAlgorithm = None
     # For matryoshka embeddings
     dimensions: Optional[list[int]] = None
@@ -734,6 +743,25 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         if batch.seq_lens_sum is None and seq_lens_cpu is not None:
             batch.seq_lens_sum = int(seq_lens_cpu.sum())
 
+        # Beam-search cascade attention metadata. Only built for beam decode
+        # batches when the feature is enabled, so the default path pays nothing.
+        # Values come from CPU-side state only (no device sync).
+        beam_widths = beam_prompt_lens = beam_slot_starts = None
+        if (
+            batch.reqs
+            and batch.reqs[0].is_beam_search
+            and batch.forward_mode.is_decode()
+            and envs.SGLANG_BEAM_SEARCH_CASCADE_ATTN.get()
+        ):
+            # batch_slot_start_idx == -1 means the request has not been expanded
+            # into beam rows yet; such a batch cannot use cascade.
+            if all(r.beam_list.batch_slot_start_idx != -1 for r in batch.reqs):
+                beam_widths = [r.beam_width for r in batch.reqs]
+                beam_prompt_lens = [len(r.origin_input_ids) for r in batch.reqs]
+                beam_slot_starts = [
+                    r.beam_list.batch_slot_start_idx for r in batch.reqs
+                ]
+
         ret = cls(
             # Required core inputs
             forward_mode=batch.forward_mode,
@@ -767,6 +795,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             is_prefill_only=batch.is_prefill_only,
             # Derive directly from reqs: ScheduleBatch carries no separate flag.
             is_beam_search=bool(batch.reqs and batch.reqs[0].is_beam_search),
+            beam_widths=beam_widths,
+            beam_prompt_lens=beam_prompt_lens,
+            beam_slot_starts=beam_slot_starts,
             spec_algorithm=batch.spec_algorithm,
             capture_hidden_mode=capture_hidden_mode,
             return_hidden_states_before_norm=return_hidden_states_before_norm,

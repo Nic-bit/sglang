@@ -4511,6 +4511,19 @@ class ServerArgs:
                 f"features: {', '.join(modified)}"
             )
 
+        # Cascade attention for beam decode is flashinfer-only; warn early if
+        # the env is set but the resolved decode backend cannot use it.
+        from sglang.srt.environ import envs as _envs
+
+        if _envs.SGLANG_BEAM_SEARCH_CASCADE_ATTN.get():
+            _, decode_backend = self._resolved_attention_backends()
+            if decode_backend != "flashinfer":
+                logger.warning(
+                    "SGLANG_BEAM_SEARCH_CASCADE_ATTN is set but the decode "
+                    f"attention backend is {decode_backend!r}; cascade "
+                    "attention requires flashinfer and will be ignored."
+                )
+
     def _handle_multi_item_scoring(self):
         """Setup and validate multi-item scoring constraints.
 
