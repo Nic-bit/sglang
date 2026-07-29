@@ -21,6 +21,7 @@ Usage:
 python3 test_beam_search_diff.py -v
 """
 
+import os
 import unittest
 from typing import List, Set
 
@@ -40,7 +41,11 @@ class TestBeamSearchDiff(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         """Set up test fixtures that are shared across all tests."""
-        cls.model_path = DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        # Allow overriding the test model with a local path (e.g. offline
+        # servers without HuggingFace access). Defaults to the CI model.
+        cls.model_path = os.environ.get(
+            "SGLANG_TEST_BEAM_SEARCH_MODEL_PATH", DEFAULT_SMALL_MODEL_NAME_FOR_TEST
+        )
         cls.prompt = "Hello SGLang"
         cls.max_new_tokens = 10
         cls.overlap_threshold = 0.8
