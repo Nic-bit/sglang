@@ -77,6 +77,23 @@ class BeamCascadeDecodeHelper:
         # kv_last_page_len is always ones.
         self._ones_buf = torch.ones(256, dtype=torch.int32, device=self.device)
 
+        # Optional wall-clock breakdown (SGLANG_BEAM_CASCADE_PROFILE=1). Used to
+        # attribute the cascade overhead between the per-step CPU plan and the
+        # per-layer attention/merge kernels. Off by default (zero overhead).
+        from sglang.srt.environ import envs
+
+        self._profile = envs.SGLANG_BEAM_CASCADE_PROFILE.get()
+        self._prof = {"plan_s": 0.0, "fwd_s": 0.0, "plan_n": 0, "fwd_n": 0}
+
+    def profile_summary(self) -> str:
+        p = self._prof
+        return (
+            f"[beam-cascade] plan: {p['plan_s'] * 1e3:.1f}ms over {p['plan_n']} steps "
+            f"({p['plan_s'] / max(p['plan_n'], 1) * 1e3:.3f}ms/step) | "
+            f"fwd: {p['fwd_s'] * 1e3:.1f}ms over {p['fwd_n']} layer-calls "
+            f"({p['fwd_s'] / max(p['fwd_n'], 1) * 1e3:.3f}ms/call)"
+        )
+
     def _ones(self, n: int) -> torch.Tensor:
         if n > self._ones_buf.numel():
             self._ones_buf = torch.ones(
@@ -88,6 +105,24 @@ class BeamCascadeDecodeHelper:
 
     def plan(self, forward_batch: ForwardBatch) -> Optional[BeamCascadeMetadata]:
         """Build cascade metadata for this decode step; None means fallback."""
+        if not self._profile:
+            return self._plan_impl(forward_batch)
+
+        import time
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        md = self._plan_impl(forward_batch)
+        torch.cuda.synchronize()
+        self._prof["plan_s"] += time.perf_counter() - t0
+        self._prof["plan_n"] += 1
+        if self._prof["plan_n"] % 64 == 0:
+            logger.info(self.profile_summary())
+        return md
+
+    def _plan_impl(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[BeamCascadeMetadata]:
         from sglang.kernels.ops.kvcache.kv_indices import (
             create_flashinfer_kv_indices_triton,
         )
@@ -212,6 +247,26 @@ class BeamCascadeDecodeHelper:
         )
 
     def forward(
+        self,
+        q: torch.Tensor,
+        kv_cache: Tuple[torch.Tensor, torch.Tensor],
+        layer,
+        metadata: BeamCascadeMetadata,
+    ) -> torch.Tensor:
+        if not self._profile:
+            return self._forward_impl(q, kv_cache, layer, metadata)
+
+        import time
+
+        torch.cuda.synchronize()
+        t0 = time.perf_counter()
+        o = self._forward_impl(q, kv_cache, layer, metadata)
+        torch.cuda.synchronize()
+        self._prof["fwd_s"] += time.perf_counter() - t0
+        self._prof["fwd_n"] += 1
+        return o
+
+    def _forward_impl(
         self,
         q: torch.Tensor,
         kv_cache: Tuple[torch.Tensor, torch.Tensor],

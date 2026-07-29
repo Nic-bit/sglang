@@ -253,6 +253,13 @@ class Envs:
     # the shared KV once per beam. Only effective with --enable-beam-search on a
     # supported attention backend; no-op otherwise. Phase 2 feature (WIP).
     SGLANG_BEAM_SEARCH_CASCADE_ATTN = EnvBool(False)
+    # Minimum shared-prompt length (tokens) for the cascade path to engage.
+    # Below this, the per-step plan/merge overhead outweighs the saved prompt-KV
+    # bandwidth and the regular decode path is used instead.
+    SGLANG_BEAM_CASCADE_MIN_PROMPT_LEN = EnvInt(512)
+    # Log a plan-vs-forward wall-clock breakdown for the beam cascade path.
+    # Adds cuda synchronize calls, so use for diagnosis only.
+    SGLANG_BEAM_CASCADE_PROFILE = EnvBool(False)
 
     # HTTP server
     # Decompress request bodies tagged with `x-body-compressed`.

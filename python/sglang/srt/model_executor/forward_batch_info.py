@@ -755,7 +755,14 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             # batch_slot_start_idx == -1 means the request has not been expanded
             # into beam rows yet; such a batch cannot use cascade.
-            if all(r.beam_list.batch_slot_start_idx != -1 for r in batch.reqs):
+            # Short prompts also skip cascade entirely (plan/merge overhead
+            # outweighs the saved bandwidth), keeping CUDA graph usable.
+            min_prompt_len = envs.SGLANG_BEAM_CASCADE_MIN_PROMPT_LEN.get()
+            if all(
+                r.beam_list.batch_slot_start_idx != -1 for r in batch.reqs
+            ) and all(
+                len(r.origin_input_ids) >= min_prompt_len for r in batch.reqs
+            ):
                 beam_widths = [r.beam_width for r in batch.reqs]
                 beam_prompt_lens = [len(r.origin_input_ids) for r in batch.reqs]
                 beam_slot_starts = [
