@@ -95,6 +95,18 @@ class AttentionBackend(ABC):
         :py:meth:`init_forward_metadata_out_graph` call."""
         return False
 
+    def can_run_beam_cascade_graph(self, forward_batch: ForwardBatch) -> bool:
+        """True when this beam-search batch can replay a captured cascade graph.
+
+        Only the FlashInfer backend implements beam-search cascade attention;
+        every other backend keeps beam batches on the eager path.
+        """
+        return False
+
+    def beam_cascade_graph_buckets(self, max_bs: int):
+        """Batch sizes to capture cascade graphs for (empty = feature off)."""
+        return []
+
     # Opt out only when this backend never reads seq_lens_cpu / seq_lens_sum.
     needs_cpu_seq_lens: bool = True
 

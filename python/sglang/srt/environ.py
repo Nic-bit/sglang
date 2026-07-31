@@ -257,6 +257,16 @@ class Envs:
     # Below this, the per-step plan/merge overhead outweighs the saved prompt-KV
     # bandwidth and the regular decode path is used instead.
     SGLANG_BEAM_CASCADE_MIN_PROMPT_LEN = EnvInt(512)
+    # Minimum beam width for the cascade path to engage. Measured crossover:
+    # negative at K=16 (0.75x), strongly positive at K=128 (1.41x) on 4K-token
+    # prompts; small K cannot fill the shared-level kernel and the fixed
+    # merge/plan overhead dominates.
+    SGLANG_BEAM_CASCADE_MIN_BEAM_WIDTH = EnvInt(32)
+    # Capture CUDA graphs for the cascade decode path at this uniform beam
+    # width (0 = no cascade graphs; eager cascade only). When set, buckets
+    # [K, 2K, 4K, ...] up to the runner's max batch size are captured and
+    # uniform-width beam batches that exactly match a bucket replay the graph.
+    SGLANG_BEAM_CASCADE_CAPTURE_BEAM_WIDTH = EnvInt(0)
     # Log a plan-vs-forward wall-clock breakdown for the beam cascade path.
     # Adds cuda synchronize calls, so use for diagnosis only.
     SGLANG_BEAM_CASCADE_PROFILE = EnvBool(False)

@@ -755,13 +755,23 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
         ):
             # batch_slot_start_idx == -1 means the request has not been expanded
             # into beam rows yet; such a batch cannot use cascade.
-            # Short prompts also skip cascade entirely (plan/merge overhead
-            # outweighs the saved bandwidth), keeping CUDA graph usable.
+            # Short prompts and narrow beams also skip cascade entirely (the
+            # plan/merge overhead outweighs the gain there; see the measured
+            # crossover documented in environ.py), which also keeps the regular
+            # decode CUDA graph usable for those batches.
             min_prompt_len = envs.SGLANG_BEAM_CASCADE_MIN_PROMPT_LEN.get()
+            min_beam_width = envs.SGLANG_BEAM_CASCADE_MIN_BEAM_WIDTH.get()
+            # Capturing cascade graphs at a given width is an explicit opt-in to
+            # run cascade at that width, so it lowers the gate accordingly
+            # (otherwise the captured graphs could never be replayed).
+            capture_k = envs.SGLANG_BEAM_CASCADE_CAPTURE_BEAM_WIDTH.get()
+            if capture_k > 0:
+                min_beam_width = min(min_beam_width, capture_k)
             if all(
-                r.beam_list.batch_slot_start_idx != -1 for r in batch.reqs
-            ) and all(
-                len(r.origin_input_ids) >= min_prompt_len for r in batch.reqs
+                r.beam_list.batch_slot_start_idx != -1
+                and len(r.origin_input_ids) >= min_prompt_len
+                and r.beam_width >= min_beam_width
+                for r in batch.reqs
             ):
                 beam_widths = [r.beam_width for r in batch.reqs]
                 beam_prompt_lens = [len(r.origin_input_ids) for r in batch.reqs]

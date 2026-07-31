@@ -741,6 +741,22 @@ class FlashInferAttnBackend(AttentionBackend):
             self._prepare_cuda_graph_metadata(bs, num_tokens, forward_mode, spec_info)
 
         if forward_mode.is_decode_or_idle():
+            # Beam cascade graph: refresh the cascade wrappers instead of the
+            # regular decode wrappers (the captured kernel sequence for this
+            # variant is the two-level cascade, not the decode kernel).
+            if getattr(forward_batch, "beam_widths", None) and (
+                self._beam_cascade_helper is not None
+                and self._beam_cascade_helper._graph_K > 0
+            ):
+                metadata = self._beam_cascade_helper.plan_for_graph(
+                    forward_batch, bs, in_capture
+                )
+                self.forward_metadata = DecodeMetadata(
+                    self.decode_cuda_graph_metadata.get(bs, self.decode_wrappers),
+                    beam_cascade=metadata,
+                )
+                return
+
             self.indices_updater_decode.update(
                 req_pool_indices[:bs],
                 seq_lens[:bs],
@@ -953,6 +969,25 @@ class FlashInferAttnBackend(AttentionBackend):
             )
         return metadata
 
+    def can_run_beam_cascade_graph(self, forward_batch: ForwardBatch) -> bool:
+        """Whether this beam batch can replay a captured cascade CUDA graph.
+
+        Used by the decode graph runner to pick between the cascade graph, the
+        regular decode graph, and eager. False whenever cascade graphs are not
+        configured, so the default path is unaffected.
+        """
+        helper = self._beam_cascade_helper
+        if helper is None:
+            return False
+        return helper.can_run_graph(forward_batch)
+
+    def beam_cascade_graph_buckets(self, max_bs: int):
+        """Cascade capture buckets, or [] when cascade graphs are disabled."""
+        helper = self._beam_cascade_helper
+        if helper is None:
+            return []
+        return helper.graph_bucket_list(max_bs)
+
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         swa_out_cache_loc = None
         if self.use_sliding_window_kv_pool and forward_batch.out_cache_loc is not None:
@@ -1093,6 +1128,19 @@ class FlashInferAttnBackend(AttentionBackend):
             )
             self.cuda_graph_qk_indptr = [x.clone() for x in self.kv_indptr]
             self.cuda_graph_qo_indptr = [x.clone() for x in self.kv_indptr]
+
+        # Beam cascade graph staging buffers (no-op unless
+        # SGLANG_BEAM_CASCADE_CAPTURE_BEAM_WIDTH > 0).
+        if envs.SGLANG_BEAM_CASCADE_CAPTURE_BEAM_WIDTH.get() > 0:
+            from sglang.srt.layers.attention.flashinfer_beam_cascade import (
+                BeamCascadeDecodeHelper,
+            )
+
+            if self._beam_cascade_helper is None:
+                self._beam_cascade_helper = BeamCascadeDecodeHelper(
+                    self._beam_cascade_model_runner, self
+                )
+            self._beam_cascade_helper.init_graph_state(max_bs)
 
     def _create_decode_wrappers(self, bs: int, num_tokens: int) -> list:
         return [

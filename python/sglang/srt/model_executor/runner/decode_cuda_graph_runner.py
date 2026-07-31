@@ -177,6 +177,13 @@ def build_replay_fb_view(
         # when mamba-track is disabled.
         mamba_track_indices=getattr(buffers, "mamba_track_indices", None),
         spec_info=forward_batch.spec_info,
+        # Beam-search cascade metadata rides through unchanged: it is CPU-side
+        # grouping info (widths / prompt lens / row starts) that the cascade
+        # graph's replay-prep reads to rebuild its indices. None for every
+        # non-beam batch, so the regular path is untouched.
+        beam_widths=getattr(forward_batch, "beam_widths", None),
+        beam_prompt_lens=getattr(forward_batch, "beam_prompt_lens", None),
+        beam_slot_starts=getattr(forward_batch, "beam_slot_starts", None),
     )
 
 
@@ -457,6 +464,17 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             return "lora"
         return "nolora"
 
+    def _resolve_graph_variant(self, forward_batch: ForwardBatch):
+        """Graph key variant. Beam cascade graphs live in their own namespace.
+
+        The cascade variant records a different kernel sequence (two attentions
+        plus merge_state) for the same batch size, so it must never collide with
+        the regular decode graph of that size.
+        """
+        if self.attn_backend.can_run_beam_cascade_graph(forward_batch):
+            return "beamcascade"
+        return self._resolve_lora_variant(forward_batch)
+
     @staticmethod
     def _forward_is_dp_local(model_runner) -> bool:
         """The DSpark dense draft runs attn-TP-local (draft_tp_context): each
@@ -500,10 +518,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         )
 
     def can_run_graph(self, forward_batch: ForwardBatch):
-        # Beam-search cascade attention re-plans two wrappers every step with
-        # batch-dependent shapes, which is incompatible with graph replay.
+        # Beam-search batches: only the captured cascade graph shape is
+        # replayable. Everything else (eager cascade, or cascade disabled)
+        # stays on the eager path, because the regular decode graph's captured
+        # kernel sequence does not match the cascade one.
         if forward_batch.beam_widths:
-            return False
+            return self.attn_backend.can_run_beam_cascade_graph(forward_batch)
 
         # Disable for token embedding overrides (dynamic per-request)
         if forward_batch.replace_embeds is not None:
@@ -540,7 +560,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         graph_key = self._make_graph_key(
             cuda_graph_bs,
             stream_idx=get_current_stream_idx() if self.enable_pdmux else None,
-            variant_label=self._resolve_lora_variant(forward_batch),
+            variant_label=self._resolve_graph_variant(forward_batch),
         )
 
         is_bs_supported = (
@@ -674,6 +694,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         size: int,
         stream_idx: Optional[int] = None,
         num_tokens: Optional[int] = None,
+        beam_cascade_k: int = 0,
     ):
         """Build the dummy decode ForwardBatch for capture at size (=bs),
         populate static input buffers, choose the active attn backend, and
@@ -825,6 +846,18 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if buffers.ngram_embedding_info is not None:
             forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)
 
+        if beam_cascade_k:
+            # Structural beam grouping for cascade capture: bs rows split into
+            # bs//K uniform groups. Only the shape matters here -- the cascade
+            # planner builds its own dummy index layout during capture and
+            # rewrites everything from the real batch before each replay.
+            num_groups = bs // beam_cascade_k
+            forward_batch.beam_widths = [beam_cascade_k] * num_groups
+            forward_batch.beam_prompt_lens = [1] * num_groups
+            forward_batch.beam_slot_starts = [
+                i * beam_cascade_k for i in range(num_groups)
+            ]
+
         return forward_batch, attn_backend, pp_proxy_tensors
 
     def capture(self) -> None:
@@ -915,12 +948,47 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 ) as forward:
                     self.capture_one_shape(bs, forward, stream_idx, variant_label)
 
+        self._capture_beam_cascade_shapes(stream_idx)
+
+    def _capture_beam_cascade_shapes(self, stream_idx: Optional[int] = None) -> None:
+        """Capture the beam-search cascade decode graphs (opt-in).
+
+        These are a separate variant namespace ("beamcascade") because the
+        recorded kernel sequence differs from the regular decode graph: two
+        paged-prefill attentions plus merge_state per layer. No-op unless
+        SGLANG_BEAM_CASCADE_CAPTURE_BEAM_WIDTH is set.
+        """
+        buckets = self.attn_backend.beam_cascade_graph_buckets(self.max_bs)
+        if not buckets:
+            return
+        K = envs.SGLANG_BEAM_CASCADE_CAPTURE_BEAM_WIDTH.get()
+        logger.info(
+            f"Capturing beam-search cascade decode graphs (beam_width={K}, "
+            f"batch sizes={buckets})"
+        )
+        _set_capture_lora_variant(None)
+        for bs in reversed(buckets):
+            with torch_compile_decoration.patch_model(
+                self.model_runner.model,
+                bs in self.compile_bs,
+                num_tokens=bs * self.captured_req_width,
+                tp_group=self.model_runner.tp_group,
+            ) as forward:
+                self.capture_one_shape(
+                    bs,
+                    forward,
+                    stream_idx,
+                    "beamcascade",
+                    beam_cascade_k=K,
+                )
+
     def capture_one_shape(
         self,
         size: int,
         forward: Callable,
         stream_idx: Optional[int] = None,
         variant_label: Optional[str] = None,
+        beam_cascade_k: int = 0,
     ):
         num_tokens = size * self.captured_req_width
         bs = self._ragged_capture_slots(num_tokens) if self.ragged_verify_mode else size
@@ -932,7 +1000,10 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             ), "Breakable CUDA graph is required for --debug-cuda-graph"
 
         forward_batch, attn_backend, pp_proxy_tensors = self.capture_prepare(
-            bs, stream_idx=stream_idx, num_tokens=num_tokens
+            bs,
+            stream_idx=stream_idx,
+            num_tokens=num_tokens,
+            beam_cascade_k=beam_cascade_k,
         )
 
         # All setup hooks below read get_attn_backend() (TboForwardBatchPreparer,
@@ -1100,7 +1171,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                 self.buffers.input_embeds[: self.raw_num_token].copy_(
                     forward_batch.input_embeds
                 )
-            variant_label = self._resolve_lora_variant(forward_batch)
+            variant_label = self._resolve_graph_variant(forward_batch)
             stream_idx = get_current_stream_idx() if self.enable_pdmux else None
             self._replay_graph_key = self._make_graph_key(
                 graph_size_key, stream_idx, variant_label
@@ -1201,7 +1272,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         if self.model_runner.hisparse_coordinator is not None:
             self.model_runner.hisparse_coordinator.num_real_reqs.fill_(raw_bs)
 
-        variant_label = self._resolve_lora_variant(forward_batch)
+        variant_label = self._resolve_graph_variant(forward_batch)
         stream_idx = get_current_stream_idx() if self.enable_pdmux else None
         self._replay_graph_key = self._make_graph_key(
             graph_size_key, stream_idx, variant_label
