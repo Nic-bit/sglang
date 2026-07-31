@@ -1198,7 +1198,13 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             padded_num_tokens = graph_size_key
         else:
             raw_num_token = raw_bs * self.captured_req_width
-            if self.require_mlp_tp_gather:
+            if self.attn_backend.can_run_beam_cascade_graph(forward_batch):
+                # Cascade graphs are captured at the exact bucket sizes
+                # [K, 2K, ...] which need not exist in capture_bs; can_run
+                # already guaranteed an exact match, so never pad here (a
+                # padded bs would look up a graph key that was never captured).
+                bs = raw_bs
+            elif self.require_mlp_tp_gather:
                 max_num_tokens = max(forward_batch.global_num_tokens_cpu)
                 max_batch_size = (
                     max_num_tokens / self.captured_req_width

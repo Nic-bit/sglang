@@ -94,6 +94,26 @@ class BeamCascadeDecodeHelper:
         self._graph_kv_indices_s: Optional[torch.Tensor] = None
         self._graph_kv_indices_u: Optional[torch.Tensor] = None
 
+        # Per-step path counter, dumped to a fixed file so a bench run can be
+        # attributed definitively (eager plan vs graph capture/replay). Near
+        # zero cost: two dict increments per decode step + a tiny file write
+        # every 16 steps.
+        self._mode_counts = {"eager_plan": 0, "graph_capture": 0, "graph_replay": 0}
+
+    def _bump_mode(self, key: str):
+        self._mode_counts[key] += 1
+        total = sum(self._mode_counts.values())
+        if total % 16 == 0:
+            try:
+                with open("/tmp/sglang_beam_cascade_mode.txt", "w") as f:
+                    f.write(
+                        f"[beam-cascade mode] {self._mode_counts} "
+                        f"(graph_K={self._graph_K}, "
+                        f"captured_buckets={sorted(self._graph_wrappers)})\n"
+                    )
+            except OSError:
+                pass
+
     def profile_summary(self) -> str:
         p = self._prof
         return (
@@ -254,6 +274,7 @@ class BeamCascadeDecodeHelper:
             non_blocking=True,
         )
 
+        self._bump_mode("eager_plan")
         return BeamCascadeMetadata(
             shared_wrapper=self.shared_wrapper,
             unique_wrapper=self.unique_wrapper,
@@ -518,8 +539,10 @@ class BeamCascadeDecodeHelper:
             # From now on every plan on these wrappers is the sync-free path.
             shared_w.begin_forward = partial(fast_prefill_plan, shared_w)
             unique_w.begin_forward = partial(fast_prefill_plan, unique_w)
+            self._bump_mode("graph_capture")
         else:
             self._plan_graph_replay(forward_batch, bs, shared_w, unique_w, common)
+            self._bump_mode("graph_replay")
 
         return BeamCascadeMetadata(
             shared_wrapper=shared_w,
