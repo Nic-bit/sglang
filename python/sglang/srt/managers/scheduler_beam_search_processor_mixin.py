@@ -461,6 +461,8 @@ class SchedulerBeamSearchProcessorMixin:
                     beam.finish_reason = FINISHED_MATCHED_REGEX(matched=stop_regex_str)
                     return True
 
+        return False
+
     def _tail_str(self: Scheduler, req, tokens: List[int]) -> str:
         """Get tail string from token sequence for stop condition checking.
 
